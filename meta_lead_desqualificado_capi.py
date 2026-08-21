@@ -175,8 +175,13 @@ def build_user_data(lead: dict) -> dict:
 def build_event_payload(lead: dict) -> dict:
     user_data = build_user_data(lead)
 
-    action_source = "business_messaging" if lead.get("origem") == "whatsapp" else "system_generated"
-
+    # IMPORTANTE: action_source e sempre "system_generated", mesmo para leads
+    # de origem WhatsApp. A Meta so aceita "business_messaging" quando o
+    # event_name esta numa lista fixa de eventos padrao (Purchase,
+    # LeadSubmitted, QualifiedLead, etc.) -- um nome customizado como
+    # "LeadDesqualificado" e rejeitado com HTTP 400 / error_subcode 2804066
+    # nessa fonte. O ctwa_clid continua indo em user_data normalmente como
+    # chave de correspondencia, isso nao depende do action_source.
     event = {
         "event_name": "LeadDesqualificado",
         "event_time": int(time.time()),
@@ -184,14 +189,11 @@ def build_event_payload(lead: dict) -> dict:
         # espelhado, e a deduplicacao do Meta e por dataset (pixel), entao
         # nao ha conflito entre eusebio e iris.
         "event_id": str(uuid.uuid4()),
-        "action_source": action_source,
+        "action_source": "system_generated",
         "value": 0,
         "currency": "BRL",
         "user_data": user_data,
     }
-
-    if lead.get("origem") == "whatsapp":
-        event["messaging_channel"] = "whatsapp"
 
     return {"data": [event]}
 
