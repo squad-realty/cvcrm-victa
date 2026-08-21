@@ -211,9 +211,11 @@ def main() -> None:
     leads = buscar_leads_cancelados(CV_CRM_IDSITUACAO_CANCELADO)
 
     maior_data_cancelamento = ultima_data_processada
-    enviados = 0
+    enviados = 0          # sucesso nas DUAS contas
+    parciais = 0          # sucesso em uma conta, falha na outra
     ignorados_motivo = 0
-    falhas = 0
+    ignorados_sem_dados = 0
+    falhas = 0            # falha nas DUAS contas (ou exception nao tratada)
 
     for lead_cv in leads:
         data_cancelamento = lead_cv.get("data_cancelamento", "")
@@ -232,7 +234,27 @@ def main() -> None:
         try:
             resultado = enviar_lead_desqualificado(lead_mapeado)
             print(f"Lead {lead_cv.get('idlead')} -> {resultado}")
-            enviados += 1
+
+            if isinstance(resultado, dict) and resultado.get("skipped"):
+                # Motivo fora do alvo (ja filtrado acima, defensivo) ou sem
+                # nenhum dado de identificacao pra casar no Meta.
+                ignorados_sem_dados += 1
+            else:
+                # resultado e {"eusebio": {...}, "iris": {...}} -- cada valor
+                # e a resposta da Meta (sucesso) ou {"erro": "..."} (falha
+                # so daquela conta). Conta como falha de fato so se TODAS as
+                # contas falharam; parcial se so uma falhou.
+                contas_com_erro = sum(
+                    1 for v in resultado.values() if isinstance(v, dict) and "erro" in v
+                )
+                if contas_com_erro == 0:
+                    enviados += 1
+                elif contas_com_erro == len(resultado):
+                    falhas += 1
+                    print(f"Lead {lead_cv.get('idlead')} FALHOU nas duas contas -- ver erro acima.")
+                else:
+                    parciais += 1
+                    print(f"Lead {lead_cv.get('idlead')} falhou em parte das contas -- ver erro acima.")
         except Exception as erro:
             print(f"Lead {lead_cv.get('idlead')} FALHOU -> {erro.__class__.__name__}: {erro}")
             falhas += 1
@@ -245,7 +267,13 @@ def main() -> None:
     estado["ultima_data_cancelamento_processada"] = maior_data_cancelamento
     salvar_estado(estado)
 
-    print(f"Concluido. Enviados: {enviados}. Ignorados (motivo fora do alvo): {ignorados_motivo}. Falhas: {falhas}.")
+    print(
+        f"Concluido. Enviados (2 contas ok): {enviados}. "
+        f"Parciais (1 conta falhou): {parciais}. "
+        f"Ignorados (motivo fora do alvo): {ignorados_motivo}. "
+        f"Ignorados (sem dado de identificacao): {ignorados_sem_dados}. "
+        f"Falhas (2 contas falharam): {falhas}."
+    )
 
 
 if __name__ == "__main__":
