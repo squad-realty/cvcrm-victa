@@ -1,33 +1,44 @@
 """
 Polling CV CRM -> Meta Conversions API
-Cliente: Victa Engenharia - Vitoria Eusebio (idempreendimento 43)
+Cliente: Victa Engenharia - Linha Vitória (Eusébio, Jasmim, Íris, Maracanaú)
 
 O QUE ESTE SCRIPT FAZ
 ---------------------
-1. Busca os leads na situacao "Cancelado/Descartado" (id fixo, configurado
-   via secret) desde a ultima execucao (controle via state.json).
-2. Filtra apenas os leads do empreendimento Vitoria Eusebio (idempreendimento
-   43) -- o CV CRM da Victa e uma conta UNICA compartilhada entre todos os
-   empreendimentos, entao sem esse filtro leads de outras obras (Vista
-   Coqueiral, etc.) vazariam para este pixel.
-3. Dentro desses, filtra pelos motivos de cancelamento-alvo combinados com
-   o cliente.
-4. Envia o evento "LeadDesqualificado" via Meta CAPI para o dataset
-   conversoes-eusebio.
-5. Atualiza o state.json com o timestamp mais recente processado.
+1. Descobre automaticamente o ID da situacao "Cancelado" no workflow de Leads
+   do CV CRM (via GET /workflows/{funcionalidade}), para nao depender de um
+   numero fixo que pode mudar entre ambientes.
+2. Busca os leads cancelados (GET /v1/comercial/leads?idsituacao=...) desde a
+   ultima execucao (controle feito por um arquivo local state.json). Os 4
+   empreendimentos da linha Vitória compartilham a mesma situacao
+   "Cancelado", entao uma unica chamada ja cobre os 4 juntos.
+3. Filtra apenas os leads cujo "motivo_cancelamento.nome" esteja na lista de
+   motivos-alvo combinada com o cliente.
+4. Para cada lead filtrado, monta o payload e envia o evento
+   "LeadDesqualificado" via Meta CAPI pras DUAS contas (eusebio e iris),
+   reaproveitando a logica de meta_lead_desqualificado_capi.py -- nao ha
+   roteamento por empreendimento, todo lead desqualificado vai pras duas.
+5. Atualiza o state.json com o timestamp mais recente processado, para a
+   proxima execucao nao reprocessar os mesmos leads.
 
-CREDENCIAIS (variaveis de ambiente / secrets do GitHub Actions):
-    CV_CRM_SUBDOMINIO             -> "victa"
-    CV_CRM_EMAIL
-    CV_CRM_TOKEN
-    CV_CRM_IDSITUACAO_CANCELADO   -> "3" (mesma conta CV CRM que o Coqueiral)
-    META_CAPI_ACCESS_TOKEN        -> token do dataset conversoes-eusebio
+CREDENCIAIS (variaveis de ambiente, nunca hardcode):
+    CV_CRM_SUBDOMINIO             -> subdominio do CV CRM (victa)
+    CV_CRM_EMAIL                  -> e-mail do usuario administrativo com token gerado
+    CV_CRM_TOKEN                  -> token gerado no painel do gestor
+    CV_CRM_IDSITUACAO_CANCELADO   -> id da situacao "Cancelado", compartilhado pelos 4 empreendimentos
+    META_CAPI_ACCESS_TOKEN_EUSEBIO -> token de acesso do dataset conversões-eusébio
+    META_CAPI_ACCESS_TOKEN_IRIS    -> token de acesso do dataset da conta íris
 
-PONTOS PRA VALIDAR:
-- leadgen_id/ctwa_clid: nao encontrados em campos_adicionais neste lead de
-  exemplo (so existiam cf_campanha, TAG_LEAD, Tipo_de_Oportunidade). O
-  script tenta mesmo assim por alguns nomes de slug candidatos, mas cai
-  para o fallback de email/telefone/nome/external_id na pratica.
+ATENCAO / PONTOS PRA VALIDAR:
+- O nome da "funcionalidade" usado em /workflows/{funcionalidade} para Leads
+  foi assumido como "leads". Se a chamada retornar vazio/erro, verifique o
+  nome exato com o suporte do CV CRM ou no proprio painel (Configuracoes >
+  Workflows).
+- leadgen_id/ctwa_clid: o schema padrao de retorno do lead NAO tem esses
+  campos nativamente. O script tenta achar em "campos_adicionais" (lista de
+  slug/valor customizados) usando alguns nomes candidatos comuns. Se o CV CRM
+  de voces nao tiver esse campo configurado, o evento cai automaticamente
+  para o fallback de email/telefone hasheados (ainda funciona, so com EMQ
+  um pouco mais baixo).
 """
 
 import json
@@ -46,16 +57,16 @@ from meta_lead_desqualificado_capi import enviar_lead_desqualificado
 CV_CRM_SUBDOMINIO = os.environ["CV_CRM_SUBDOMINIO"]
 CV_CRM_EMAIL = os.environ["CV_CRM_EMAIL"]
 CV_CRM_TOKEN = os.environ["CV_CRM_TOKEN"]
+
+# ID da situacao "Cancelado" no workflow de Leads. Descoberto manualmente
+# (via curl em um lead ja cancelado) porque o endpoint de descoberta
+# automatica de workflow nao esta documentado publicamente para a v1.
 CV_CRM_IDSITUACAO_CANCELADO = int(os.environ["CV_CRM_IDSITUACAO_CANCELADO"])
 
 CV_CRM_BASE_URL = f"https://{CV_CRM_SUBDOMINIO}.cvcrm.com.br/api"
 HEADERS = {"email": CV_CRM_EMAIL, "token": CV_CRM_TOKEN}
 
 STATE_FILE = Path(__file__).parent / "state.json"
-
-# Empreendimento Vitoria Eusebio, confirmado via campo "empreendimentosId"
-# no retorno real da API (lead 149468).
-CV_CRM_ID_EMPREENDIMENTO = "43"
 
 MOTIVOS_DESQUALIFICACAO_ALVO = {
     "Impossível contatar",
@@ -64,6 +75,8 @@ MOTIVOS_DESQUALIFICACAO_ALVO = {
     "Engano",
 }
 
+# Nomes de slug candidatos em campos_adicionais para os IDs de clique da Meta.
+# Ajuste conforme o nome real configurado no CV CRM, se existir.
 SLUGS_LEADGEN_ID_CANDIDATOS = ["leadgen_id", "cf_leadgen_id", "meta_leadgen_id"]
 SLUGS_CTWA_CLID_CANDIDATOS = ["ctwa_clid", "cf_ctwa_clid", "meta_ctwa_clid"]
 
@@ -75,8 +88,10 @@ SLUGS_CTWA_CLID_CANDIDATOS = ["ctwa_clid", "cf_ctwa_clid", "meta_ctwa_clid"]
 def carregar_estado() -> dict:
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
-    # Sem state.json ainda: comeca 90 dias atras (eventos mais antigos nao
-    # tem uso pratico para a Custom Audience de 180 dias do Meta).
+    # Sem state.json ainda: comeca 90 dias atras, nao em 1970.
+    # Eventos mais antigos que isso nao tem uso pratico (a Custom Audience
+    # do Meta so olha ate 180 dias, e nao vale a pena reprocessar anos de
+    # historico logo na primeira execucao).
     data_inicial = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
     return {"ultima_data_cancelamento_processada": data_inicial}
 
@@ -86,27 +101,16 @@ def salvar_estado(estado: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Busca de leads cancelados (com retry e teto de seguranca)
+# Busca de leads cancelados
 # ---------------------------------------------------------------------------
 
-def _get_com_retry(url: str, params: dict, tentativas: int = 3) -> dict:
-    ultimo_erro = None
-    for tentativa in range(1, tentativas + 1):
-        timeout = 30 * tentativa  # 30s, 60s, 90s
-        try:
-            response = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as erro:
-            ultimo_erro = erro
-            if tentativa < tentativas:
-                print(f"Tentativa {tentativa}/{tentativas} falhou ({erro.__class__.__name__}). Tentando de novo...")
-            else:
-                print(f"Tentativa {tentativa}/{tentativas} falhou. Desistindo.")
-    raise ultimo_erro
-
-
 def buscar_leads_cancelados(idsituacao_cancelado: int, limit: int = 20, max_paginas: int = 50) -> list:
+    """
+    Pagina pelo endpoint de leads filtrando por idsituacao. Retorna todos os
+    leads encontrados (sem filtrar motivo ainda -- isso e feito depois).
+    Teto de max_paginas (50 x 20 = 1000 leads) como seguranca extra, alem
+    do timeout-minutes do proprio workflow.
+    """
     leads = []
     offset = 0
 
@@ -126,16 +130,38 @@ def buscar_leads_cancelados(idsituacao_cancelado: int, limit: int = 20, max_pagi
             break
         offset += limit
     else:
-        print(f"Atingiu o teto de {max_paginas} paginas -- parando por seguranca.")
+        print(f"Atingiu o teto de {max_paginas} paginas -- parando por seguranca. "
+              f"Se isso acontecer com frequencia, pode ser preciso paginar em lotes menores.")
 
     return leads
+
+
+def _get_com_retry(url: str, params: dict, tentativas: int = 3) -> dict:
+    """
+    A API do CV CRM as vezes demora para responder em consultas mais
+    pesadas. Tenta ate 3 vezes, aumentando o timeout a cada tentativa,
+    antes de desistir de fato.
+    """
+    ultimo_erro = None
+    for tentativa in range(1, tentativas + 1):
+        timeout = 30 * tentativa  # 30s, 60s, 90s
+        try:
+            response = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as erro:
+            ultimo_erro = erro
+            print(f"Tentativa {tentativa}/{tentativas} falhou ({erro.__class__.__name__}). "
+                  f"Tentando de novo com timeout maior..." if tentativa < tentativas else
+                  f"Tentativa {tentativa}/{tentativas} falhou. Desistindo.")
+    raise ultimo_erro
 
 
 # ---------------------------------------------------------------------------
 # Mapeamento CV CRM -> payload esperado pelo enviar_lead_desqualificado
 # ---------------------------------------------------------------------------
 
-def extrair_campo_adicional(campos_adicionais: list, slugs_candidatos: list):
+def extrair_campo_adicional(campos_adicionais: list, slugs_candidatos: list) -> str | None:
     for campo in campos_adicionais or []:
         if campo.get("slug") in slugs_candidatos:
             return campo.get("valor")
@@ -143,6 +169,11 @@ def extrair_campo_adicional(campos_adicionais: list, slugs_candidatos: list):
 
 
 def identificar_origem(lead: dict) -> str:
+    """
+    Usa midia_principal/midias para inferir a origem (lead_ads, whatsapp,
+    form_lp). Ajuste os termos de busca conforme o que aparece de fato nas
+    midias cadastradas para a linha Vitória.
+    """
     midia = (lead.get("midia_principal") or "").lower()
     midias = [m.lower() for m in (lead.get("midias") or [])]
     todas_midias = [midia] + midias
@@ -152,22 +183,6 @@ def identificar_origem(lead: dict) -> str:
     if any("lead ad" in m or "facebook" in m or "instagram" in m for m in todas_midias):
         return "lead_ads"
     return "form_lp"
-
-
-def eh_do_empreendimento_alvo(lead_cv: dict) -> bool:
-    """
-    Filtra para o Vitoria Eusebio usando o campo flat "empreendimentosId"
-    (confirmado no retorno real da API), com fallback para o array
-    "empreendimento" caso o flat nao venha preenchido.
-    """
-    empreendimentos_id = lead_cv.get("empreendimentosId")
-    if empreendimentos_id is not None:
-        return str(empreendimentos_id) == CV_CRM_ID_EMPREENDIMENTO
-
-    for emp in lead_cv.get("empreendimento") or []:
-        if str(emp.get("id")) == CV_CRM_ID_EMPREENDIMENTO:
-            return True
-    return False
 
 
 def mapear_lead(lead_cv: dict) -> dict:
@@ -198,17 +213,13 @@ def main() -> None:
     maior_data_cancelamento = ultima_data_processada
     enviados = 0
     ignorados_motivo = 0
-    ignorados_empreendimento = 0
     falhas = 0
 
     for lead_cv in leads:
         data_cancelamento = lead_cv.get("data_cancelamento", "")
 
+        # So processa leads cancelados depois da ultima execucao
         if data_cancelamento <= ultima_data_processada:
-            continue
-
-        if not eh_do_empreendimento_alvo(lead_cv):
-            ignorados_empreendimento += 1
             continue
 
         motivo = (lead_cv.get("motivo_cancelamento") or {}).get("nome")
@@ -226,18 +237,15 @@ def main() -> None:
             print(f"Lead {lead_cv.get('idlead')} FALHOU -> {erro.__class__.__name__}: {erro}")
             falhas += 1
 
+        # Avanca o cursor de data mesmo em caso de falha, para nao tentar
+        # reprocessar um lead permanentemente problematico a cada execucao.
         if data_cancelamento > maior_data_cancelamento:
             maior_data_cancelamento = data_cancelamento
 
     estado["ultima_data_cancelamento_processada"] = maior_data_cancelamento
     salvar_estado(estado)
 
-    print(
-        f"Concluido. Enviados: {enviados}. "
-        f"Ignorados (outro empreendimento): {ignorados_empreendimento}. "
-        f"Ignorados (motivo fora do alvo): {ignorados_motivo}. "
-        f"Falhas: {falhas}."
-    )
+    print(f"Concluido. Enviados: {enviados}. Ignorados (motivo fora do alvo): {ignorados_motivo}. Falhas: {falhas}.")
 
 
 if __name__ == "__main__":
