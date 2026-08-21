@@ -8,11 +8,15 @@ O QUE ESTE SCRIPT FAZ
    do CV CRM (via GET /workflows/{funcionalidade}), para nao depender de um
    numero fixo que pode mudar entre ambientes.
 2. Busca os leads cancelados (GET /v1/comercial/leads?idsituacao=...) desde a
-   ultima execucao (controle feito por um arquivo local state.json). Os 4
-   empreendimentos da linha Vitória compartilham a mesma situacao
-   "Cancelado", entao uma unica chamada ja cobre os 4 juntos.
-3. Filtra apenas os leads cujo "motivo_cancelamento.nome" esteja na lista de
-   motivos-alvo combinada com o cliente.
+   ultima execucao (controle feito por um arquivo local state.json). A
+   situacao "Cancelado" e COMPARTILHADA por toda a conta CV CRM da Victa --
+   nao e exclusiva dos 4 empreendimentos da linha Vitoria -- entao essa busca
+   sozinha traz leads de outros produtos tambem.
+3. Filtra pelos 4 empreendimentos da linha Vitoria (EMPREENDIMENTOS_ALVO,
+   usando o campo "idempreendimento" do lead) E pelo "motivo_cancelamento.nome"
+   estar na lista de motivos-alvo combinada com o cliente. As duas condicoes
+   sao obrigatorias -- sem o filtro de empreendimento, leads desqualificados
+   de qualquer outro produto da Victa tambem disparariam evento no Meta.
 4. Para cada lead filtrado, monta o payload e envia o evento
    "LeadDesqualificado" via Meta CAPI pras DUAS contas (eusebio e iris),
    reaproveitando a logica de meta_lead_desqualificado_capi.py -- nao ha
@@ -73,6 +77,18 @@ MOTIVOS_DESQUALIFICACAO_ALVO = {
     "Não deseja ser contatada",
     "Não tem perfil Financeiro",
     "Engano",
+}
+
+# idempreendimento (retornado pelo CV CRM em cada lead) dos 4 empreendimentos
+# da linha Vitoria -- IDs conferidos direto na tela de Empreendimentos do
+# painel. So leads com idempreendimento nessa lista disparam evento no Meta;
+# qualquer outro produto da Victa que compartilhe a mesma situacao
+# "Cancelado" e ignorado.
+EMPREENDIMENTOS_ALVO = {
+    43: "Vitória Eusébio",
+    35: "Vitória Jasmim",
+    40: "Vitória Íris",
+    42: "Vitória Maracanaú",
 }
 
 # Nomes de slug candidatos em campos_adicionais para os IDs de clique da Meta.
@@ -196,6 +212,7 @@ def mapear_lead(lead_cv: dict) -> dict:
         "telefone": lead_cv.get("telefone"),
         "idlead": lead_cv.get("idlead"),
         "nome": lead_cv.get("nome"),
+        "idempreendimento": lead_cv.get("idempreendimento"),
         "motivo_cancelamento": (lead_cv.get("motivo_cancelamento") or {}).get("nome"),
     }
 
@@ -214,6 +231,7 @@ def main() -> None:
     enviados = 0          # sucesso nas DUAS contas
     parciais = 0          # sucesso em uma conta, falha na outra
     ignorados_motivo = 0
+    ignorados_empreendimento = 0
     ignorados_sem_dados = 0
     falhas = 0            # falha nas DUAS contas (ou exception nao tratada)
 
@@ -222,6 +240,14 @@ def main() -> None:
 
         # So processa leads cancelados depois da ultima execucao
         if data_cancelamento <= ultima_data_processada:
+            continue
+
+        # So processa os 4 empreendimentos da linha Vitoria -- a situacao
+        # "Cancelado" e compartilhada com outros produtos da Victa, entao
+        # esse filtro e obrigatorio, nao defensivo.
+        idempreendimento = lead_cv.get("idempreendimento")
+        if idempreendimento not in EMPREENDIMENTOS_ALVO:
+            ignorados_empreendimento += 1
             continue
 
         motivo = (lead_cv.get("motivo_cancelamento") or {}).get("nome")
@@ -270,6 +296,7 @@ def main() -> None:
     print(
         f"Concluido. Enviados (2 contas ok): {enviados}. "
         f"Parciais (1 conta falhou): {parciais}. "
+        f"Ignorados (fora dos 4 empreendimentos): {ignorados_empreendimento}. "
         f"Ignorados (motivo fora do alvo): {ignorados_motivo}. "
         f"Ignorados (sem dado de identificacao): {ignorados_sem_dados}. "
         f"Falhas (2 contas falharam): {falhas}."
