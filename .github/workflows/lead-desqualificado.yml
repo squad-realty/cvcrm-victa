@@ -1,10 +1,11 @@
-name: Lead Desqualificado - Vitoria Eusebio
+name: Lead Desqualificado - Linha Vitória (Eusébio, Jasmim, Íris, Maracanaú)
 
 on:
   schedule:
     - cron: "*/30 * * * *"  # a cada 30 minutos
   workflow_dispatch: {}       # permite rodar manualmente pela aba Actions
 
+# Necessario para o job poder commitar o state.json de volta no repositorio
 permissions:
   contents: write
 
@@ -30,7 +31,8 @@ jobs:
           CV_CRM_EMAIL: ${{ secrets.CV_CRM_EMAIL }}
           CV_CRM_TOKEN: ${{ secrets.CV_CRM_TOKEN }}
           CV_CRM_IDSITUACAO_CANCELADO: ${{ secrets.CV_CRM_IDSITUACAO_CANCELADO }}
-          META_CAPI_ACCESS_TOKEN: ${{ secrets.META_CAPI_ACCESS_TOKEN }}
+          META_CAPI_ACCESS_TOKEN_EUSEBIO: ${{ secrets.META_CAPI_ACCESS_TOKEN_EUSEBIO }}
+          META_CAPI_ACCESS_TOKEN_IRIS: ${{ secrets.META_CAPI_ACCESS_TOKEN_IRIS }}
         run: python poll_cv_crm_leads_desqualificados.py
 
       - name: Commitar state.json atualizado
