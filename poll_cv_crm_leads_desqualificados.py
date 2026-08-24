@@ -236,10 +236,13 @@ def main() -> None:
     falhas = 0            # falha nas DUAS contas (ou exception nao tratada)
 
     for lead_cv in leads:
-        data_cancelamento = lead_cv.get("data_cancelamento", "")
+        # .get(..., "") so cobre chave AUSENTE -- se a chave existir com
+        # valor null, o .get() retorna None mesmo assim e a comparacao com
+        # string quebra (TypeError). O "or ''" cobre os dois casos.
+        data_cancelamento = lead_cv.get("data_cancelamento") or ""
 
         # So processa leads cancelados depois da ultima execucao
-        if data_cancelamento <= ultima_data_processada:
+        if not data_cancelamento or data_cancelamento <= ultima_data_processada:
             continue
 
         # So processa os 4 empreendimentos da linha Vitoria -- a situacao
