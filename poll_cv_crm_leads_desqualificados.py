@@ -47,6 +47,7 @@ ATENCAO / PONTOS PRA VALIDAR:
 
 import json
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -152,24 +153,42 @@ def buscar_leads_cancelados(idsituacao_cancelado: int, limit: int = 20, max_pagi
     return leads
 
 
-def _get_com_retry(url: str, params: dict, tentativas: int = 3) -> dict:
+def _get_com_retry(url: str, params: dict, tentativas: int = 5) -> dict:
     """
     A API do CV CRM as vezes demora para responder em consultas mais
-    pesadas. Tenta ate 3 vezes, aumentando o timeout a cada tentativa,
-    antes de desistir de fato.
+    pesadas, ou devolve erro 503/429 quando esta sobrecarregada (comum em
+    rodadas de backfill que fazem milhares de chamadas seguidas). Tenta ate
+    5 vezes, aumentando timeout E esperando entre as tentativas, antes de
+    desistir de fato.
     """
     ultimo_erro = None
     for tentativa in range(1, tentativas + 1):
-        timeout = 30 * tentativa  # 30s, 60s, 90s
+        timeout = 30 * tentativa  # 30s, 60s, 90s, 120s, 150s
         try:
             response = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as erro:
             ultimo_erro = erro
-            print(f"Tentativa {tentativa}/{tentativas} falhou ({erro.__class__.__name__}). "
-                  f"Tentando de novo com timeout maior..." if tentativa < tentativas else
-                  f"Tentativa {tentativa}/{tentativas} falhou. Desistindo.")
+            motivo = erro.__class__.__name__
+        except requests.exceptions.HTTPError as erro:
+            status = erro.response.status_code if erro.response is not None else None
+            # 5xx (erro do servidor) e 429 (rate limit) sao transitorios --
+            # vale tentar de novo. Outros 4xx (400, 401, 403...) normalmente
+            # sao erro de credencial/parametro que retry nao resolve.
+            if status is not None and (status >= 500 or status == 429):
+                ultimo_erro = erro
+                motivo = f"HTTP {status}"
+            else:
+                raise
+
+        espera = 5 * tentativa  # 5s, 10s, 15s, 20s, 25s -- da folego pro servidor
+        if tentativa < tentativas:
+            print(f"Tentativa {tentativa}/{tentativas} falhou ({motivo}). "
+                  f"Esperando {espera}s antes de tentar de novo...")
+            time.sleep(espera)
+        else:
+            print(f"Tentativa {tentativa}/{tentativas} falhou ({motivo}). Desistindo.")
     raise ultimo_erro
 
 
@@ -182,6 +201,38 @@ def extrair_campo_adicional(campos_adicionais: list, slugs_candidatos: list) -> 
         if campo.get("slug") in slugs_candidatos:
             return campo.get("valor")
     return None
+
+
+def extrair_ids_empreendimento(lead_cv: dict) -> set:
+    """
+    O campo "idempreendimento" NAO existe no lead retornado pela API (vem
+    sempre None) -- descoberto rodando descobrir_idempreendimento.py contra
+    leads reais. O campo de verdade e "empreendimento", uma LISTA de dicts
+    tipo [{"id": 43, "nome": "VITORIA EUSEBIO"}] (um lead pode, em teoria,
+    estar associado a mais de um). Ha tambem um campo auxiliar
+    "empreendimentosId" (string, ex: "43", possivelmente separado por
+    virgula se houver mais de um) -- usado aqui so como fallback, caso a
+    lista "empreendimento" venha vazia por algum motivo.
+
+    Retorna um set de ids (int) -- pode ter mais de um, ou nenhum.
+    """
+    ids = set()
+    for item in lead_cv.get("empreendimento") or []:
+        if isinstance(item, dict) and item.get("id") is not None:
+            try:
+                ids.add(int(item["id"]))
+            except (TypeError, ValueError):
+                pass
+
+    if not ids:
+        bruto = lead_cv.get("empreendimentosId")
+        if bruto:
+            for pedaco in str(bruto).split(","):
+                pedaco = pedaco.strip()
+                if pedaco.isdigit():
+                    ids.add(int(pedaco))
+
+    return ids
 
 
 def identificar_origem(lead: dict) -> str:
@@ -212,7 +263,7 @@ def mapear_lead(lead_cv: dict) -> dict:
         "telefone": lead_cv.get("telefone"),
         "idlead": lead_cv.get("idlead"),
         "nome": lead_cv.get("nome"),
-        "idempreendimento": lead_cv.get("idempreendimento"),
+        "ids_empreendimento": sorted(extrair_ids_empreendimento(lead_cv)),
         "motivo_cancelamento": (lead_cv.get("motivo_cancelamento") or {}).get("nome"),
     }
 
@@ -248,8 +299,8 @@ def main() -> None:
         # So processa os 4 empreendimentos da linha Vitoria -- a situacao
         # "Cancelado" e compartilhada com outros produtos da Victa, entao
         # esse filtro e obrigatorio, nao defensivo.
-        idempreendimento = lead_cv.get("idempreendimento")
-        if idempreendimento not in EMPREENDIMENTOS_ALVO:
+        ids_empreendimento = extrair_ids_empreendimento(lead_cv)
+        if not ids_empreendimento & EMPREENDIMENTOS_ALVO.keys():
             ignorados_empreendimento += 1
             continue
 
