@@ -173,6 +173,8 @@ def _get_com_retry(url: str, params: dict, tentativas: int = 5) -> dict:
             motivo = erro.__class__.__name__
         except requests.exceptions.HTTPError as erro:
             status = erro.response.status_code if erro.response is not None else None
+            corpo = erro.response.text[:500] if erro.response is not None else ""
+            print(f"Erro HTTP {status} em {params} -- corpo da resposta: {corpo}")
             # 5xx (erro do servidor) e 429 (rate limit) sao transitorios --
             # vale tentar de novo. Outros 4xx (400, 401, 403...) normalmente
             # sao erro de credencial/parametro que retry nao resolve.
