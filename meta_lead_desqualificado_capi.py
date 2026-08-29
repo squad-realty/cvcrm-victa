@@ -23,11 +23,18 @@ Motivos que disparam o evento (definido com o cliente):
 
 Origem do lead determina qual match key usar (em ordem de prioridade):
     1. Lead Ads (Meta)      -> lead_id (leadgen_id) em user_data.lead_id
-    2. WhatsApp (CTWA)      -> ctwa_clid em user_data.ctwa_clid
-    3. Formulario de LP     -> email + telefone hasheados (fallback)
+    2. WhatsApp (CTWA) e
+       Formulario de LP     -> email + telefone + external_id + nome hasheados
 
-Nao envia fbc/fbp: canal principal (Lead Ads + WhatsApp) nao depende deles.
-LP e secundaria, entao nao ha script de captura client-side implementado.
+NAO enviamos ctwa_clid (mesmo pra leads de origem WhatsApp), nem fbc/fbp.
+Confirmado em producao: quando o payload leva ctwa_clid, a Meta classifica
+o evento como action_source "business_messaging" nos bastidores -- mesmo
+declarando "system_generated" -- e rejeita evento customizado
+("LeadDesqualificado") com HTTP 400 / error_subcode 2804066, ja que esse
+action_source so aceita uma lista fixa de eventos padrao (Purchase,
+LeadSubmitted, etc). E um erro permanente, entao para esse evento
+especifico o match de leads WhatsApp cai pro fallback de
+email/telefone/external_id/nome.
 """
 
 import hashlib
@@ -145,9 +152,19 @@ def build_user_data(lead: dict) -> dict:
     if origem == "lead_ads" and lead.get("leadgen_id"):
         user_data["lead_id"] = lead["leadgen_id"]
 
-    elif origem == "whatsapp" and lead.get("ctwa_clid"):
-        user_data["ctwa_clid"] = lead["ctwa_clid"]
-
+    # NAO mandamos mais ctwa_clid, nem para leads de origem WhatsApp.
+    # Confirmado nos logs do backfill: toda vez que o payload leva
+    # ctwa_clid, a Meta classifica o evento como action_source
+    # "business_messaging" nos bastidores -- mesmo declarando
+    # "system_generated" no payload -- e rejeita "LeadDesqualificado" com
+    # HTTP 400 / error_subcode 2804066 ("Forneca um valor valido... como
+    # 'Purchase' ou 'LeadSubmitted'"). Isso e permanente (nao e erro
+    # transitorio de rede), entao retentar o mesmo payload nunca ia
+    # funcionar. Pra esses leads o match cai pro fallback de
+    # email/telefone/external_id/nome abaixo -- perde um pouco de
+    # qualidade de match, mas o evento efetivamente entra na Custom
+    # Audience, que e o que importa aqui.
+    #
     # Email/telefone sempre que disponiveis, mesmo como reforco adicional
     # (nao atrapalha o match, so melhora).
     email_hash = hash_email(lead.get("email"))
